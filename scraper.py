@@ -1,0 +1,995 @@
+import os, re, time, json, requests
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import sync_playwright
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Load .env from script directory if present (local-run convenience; not used in GH Actions)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
+if not ETHERSCAN_API_KEY:
+    raise SystemExit("ETHERSCAN_API_KEY not set. Add it to .env (local) or GitHub Secrets (Actions).")
+
+SPREADSHEET_ID = "1ZXV1U2q_Y6c9NjAJxOJHqaYAQhOJPHQCfGBwFcTDX3E"
+SHEET_TAB_NAME = "dUSD Balance Sheet (Fraxtal)"
+SERVICE_ACCOUNT_FILE = str(Path(__file__).parent / "service_account.json")
+DEBANK_URL = "https://debank.com/profile/0x624E12dE7a97B8cFc1AD1F050a1c9263b1f4FeBC"
+DEBANK_URL_PROTOCOLS = "https://debank.com/profile/0xdb104e0bb0b2955f69e8e092eb80831913d85431"
+ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
+FRAXTAL_CHAIN_ID = 252
+DUSD_CONTRACT = "0x788D96f655735f52c676A133f4dFC53cEC614d4A"
+
+
+def _load_google_credentials():
+    """Load Google service account creds from env var (cloud) or local file."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if json_str:
+        return Credentials.from_service_account_info(json.loads(json_str), scopes=scopes)
+    if Path(SERVICE_ACCOUNT_FILE).exists():
+        return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    raise SystemExit("No Google credentials found. Set GOOGLE_SERVICE_ACCOUNT_JSON env var or place service_account.json next to scraper.py.")
+
+TOKEN_ROW_MAP = {
+    "frxusd":  4,
+    "sfrxusd": 5,
+    "dai":     6,
+    "sdai":    7,
+    "usdc":    8,
+    "usdt":    9,
+}
+CONVEX_ROW = 10
+CURVE_ROW = 11
+DUSD_ROW = 16
+
+KATANA_SHEET_TAB = "dUSD Balance Sheet (Katana)"
+DEBANK_URL_KATANA = "https://debank.com/profile/0xA5f9F6238406B1301D0ED09555a2893dc1A26A49"
+KATANASCAN_DUSD_URL = "https://katanascan.com/token/0xcA52d08737E6Af8763a2bF6034B3B03868f24DDA"
+
+# Katana sheet token map (sheet labels in column A; vb-prefixed wallet tokens map to unprefixed sheet rows)
+KATANA_TOKEN_ROW_MAP = {
+    "frxusd":  3,
+    "sfrxusd": 4,
+    "vbusdc":  5,  # → "USDC (Katana)"
+    "vbusdt":  6,  # → "USDT (Katana)"
+    "ausd":    7,
+    "yusd":    8,
+}
+KATANA_DUSD_ROW = 9
+
+ETHEREUM_SHEET_TAB = "dUSD Balance Sheet (Ethereum)"
+DEBANK_URL_ETHEREUM = "https://debank.com/profile/0x84c58066a4408454b7380f168c95f571419253f4"
+DEBANK_URL_AMO_ETHEREUM = "https://debank.com/profile/0x38262effcd17cd64f6311ef688b2caa61102f3db"
+DUSD_CONTRACT_ETHEREUM = "0x07fFf99e1664d9B116fbC158c0E99785F81cA236"
+ETHEREUM_CHAIN_ID = 1
+
+# Ethereum sheet — raw wallet tokens (rows 4, 6, 8, 9) plus protocol positions (rows 5, 7)
+ETHEREUM_RAW_TOKEN_ROW_MAP = {
+    "frxusd": 4,
+    "usds":   6,
+    "usdc":   8,
+    "usdt":   9,
+}
+# Protocol positions: (sheet_key, row, header, subtitle)
+ETHEREUM_PROTOCOL_POSITIONS = [
+    ("sfrxusd", 5, "Frax", "Staked"),
+    ("susds",   7, "Sky",  "Yield"),
+]
+ETHEREUM_AMO_ROW = 10
+ETHEREUM_DUSD_ROW = 11
+
+# dLEND Stats (Fraxtal)
+DLEND_FRAXTAL_SHEET_TAB = "dLEND Stats (Fraxtal)"
+DLEND_DUSD_CONTRACT = "0x29d0256fe397F6e442464982C4Cba7670646059b"   # row 4 (Total dUSD Supply)
+DLEND_SDUSD_CONTRACT = "0x6B937da34fb213763458a3b7672B950df1F560dE"  # row 19 (Total dUSD Debt — actually sdUSD per user)
+DLEND_FRXETH_CONTRACT = "0x29155d25B11EE91FEC887b09DA8ef86951799Ee0" # row 6, multiplied by frxETH price
+COINGECKO_FRXETH_URL = "https://api.coingecko.com/api/v3/simple/price?ids=frax-ether&vs_currencies=usd"
+
+# Additional dLEND token map (rows 5, 7-16); each entry: (symbol, contract, decimals, coingecko_id or None for $1, or "FXB" for bond pricing)
+DLEND_EXTRA_TOKENS = {
+    5:  ("sfrxUSD",     "0x8315047C1fdfb27656C2893B432324919F7448DE", 18, "staked-frax-usd"),
+    7:  ("sfrxETH",     "0x1F075573E3eB0D7B2D10266bA8c2c2449Fa862F7", 18, "staked-frax-ether"),
+    8:  ("sUSDe",       "0x12ED58F0744dE71C39118143dCc26977Cb99cDef", 18, "ethena-staked-usde"),
+    9:  ("scrvUSD",     "0xc569B9e1A9144E365b60CBE8a16B37bA4a764BC9", 18, "savings-crvusd"),
+    10: ("sDAI",        "0xDba7B882B61b7B86f3BA897F84C36a15CaEF3345", 18, "savings-dai"),
+    11: ("USDe",        "0x6AE1450D550e44Bb014D4c8CD98592863edB0706", 18, "ethena-usde"),
+    12: ("FXB20251231", "0x5037aE643839CEdD678368d3614F03eD1179c5D4", 18, "FXB:2025-12-31"),
+    13: ("FXB20261231", "0x2D8AE7d18D61Dd02eBF5367bb62bbd485736a0ab", 18, "FXB:2026-12-31"),
+    14: ("FXB20291231", "0xE919136c67493046fc26bF04E86A82C747eE2EDf", 18, "FXB:2029-12-31"),
+    15: ("FXB20551231", "0xF1082f0323E6a35c93A05160E0e3054B62BF4C0e", 18, "FXB:2055-12-31"),
+    16: ("wFRAX",       "0x64188DE66adD8B3d813F2Dc157dFeDaf74F10ede", 18, "frax"),
+    20: ("sdUSD",       "0x58AcC2600835211Dcb5847c5Fa422791Fd492409", 6,  "dtrinity-staked-dusd"),
+}
+FRAX_FACTS_FXB_URL = "https://facts.frax.finance/fxb"
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+# dLEND Stats (Ethereum)
+DLEND_ETHEREUM_SHEET_TAB = "dLEND Stats (Ethereum)"
+DLEND_ETHEREUM_DUSD_CONTRACT = "0x5CC741931D01Cb1ADdE193222Dfb1ad75930fd60"      # row 3, default $1
+DLEND_ETHEREUM_DUSD_DEBT_CONTRACT = "0x9477297FeacD988bE2E8bC42dFB0edf44bbfb59B" # row 19, default $1
+DLEND_ETHEREUM_DATE_ROW = 2
+
+# row → (symbol, contract, decimals, coingecko_id_or_None)
+DLEND_ETHEREUM_EXTRA_TOKENS = {
+    4:  ("sfrxUSD",   "0x979fb79D36c0D3006cDe38e992d9f51768efaAd8", 18, "staked-frax-usd"),
+    5:  ("ETH",       "0xab035F35f3e9891f5756f54bc26DD4a51cD02989", 18, "weth"),
+    6:  ("wstETH",    "0xDFAEe67e4EF9009A728dae88453275c616A5877f", 18, "wrapped-steth"),
+    7:  ("sfrxETH",   "0x3De01b66b97EAF98603920E9e850c6d7b2411dDF", 18, "staked-frax-ether"),
+    8:  ("rETH",      "0x7F90988393D1db8ef33cC9f4294A7dDA389D7cF1", 18, "rocket-pool-eth"),
+    9:  ("sUSDe",     "0x2B820Fd4911876160C3988E57A10D8A5B85dFf35", 18, "ethena-staked-usde"),
+    10: ("sUSDS",     "0xB33276a11CaBe6e1cD0252C4E1770FfD30a8029c", 18, "susds"),
+    11: ("SyrupUSDC", "0xa5535fC58Fd1be43a37367f4b66669f691A26eae", 6,  "syrupusdc"),
+    12: ("SyrupUSDT", "0xA17571a95bd22dc1a6F54d7f6E396D2398DFe493", 6,  "syrupusdt"),
+    13: ("LBTC",      "0xc247736EAaa1B45D21ae1668D13965B4b50e9011", 8,  "lombard-staked-btc"),
+    14: ("WBTC",      "0x88A4EeD28A1d7bCee95228721678662421A1C748", 8,  "wrapped-bitcoin"),
+    15: ("cbBTC",     "0x504D0Eacbf9ea5645A8A9da1b15f3708A5483AcC", 8,  "ZERO"),  # forced $0 — user will revisit
+    16: ("PAXG",      "0x8A9384b094D34db0110988D497E96B17F3B9C930", 18, "pax-gold"),
+    20: ("sdUSD",     "0x7CB20517776636eD76b68EdB3D99DCce356ABf02", 18, "dtrinity-staked-dusd"),
+}
+
+def scrape_debank():
+    print(f"\nScraping DeBank...")
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(DEBANK_URL, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+
+        lines = page.inner_text("body").split('\n')
+        lines = [l.strip() for l in lines if l.strip()]
+
+        # DeBank layout per token row:
+        # Token Name
+        # $Price
+        # Amount (number)
+        # $USD Value  <-- this is what we want
+
+        target_tokens = {
+            "frxusd":  ["frxusd"],
+            "sfrxusd": ["sfrxusd"],
+            "dai":     ["dai"],
+            "sdai":    ["sdai"],
+            "usdc":    ["usdc"],
+            "usdt":    ["usdt"],
+        }
+
+        for i, line in enumerate(lines):
+            ll = line.lower().strip()
+            for key, aliases in target_tokens.items():
+                if key in results:
+                    continue
+                if any(ll == a for a in aliases):
+                    # DeBank wallet row layout: Token / $Price / Amount / $USD Value
+                    # First $ in the next few lines is Price, second $ is USD Value.
+                    upcoming = lines[i+1:i+5]
+                    usd_values = []
+                    for upcoming_line in upcoming:
+                        if upcoming_line.startswith('$'):
+                            val_str = upcoming_line.replace('$', '').replace(',', '').strip()
+                            try:
+                                val = float(val_str)
+                                if val > 0:
+                                    usd_values.append(val)
+                            except:
+                                pass
+                    if len(usd_values) >= 2:
+                        results[key] = usd_values[1]
+                        print(f"  {key}: ${usd_values[1]:,.2f}")
+                    elif usd_values:
+                        results[key] = usd_values[0]
+                        print(f"  {key}: ${usd_values[0]:,.2f} (only one $ found, may be wrong)")
+
+        browser.close()
+
+    print(f"  Results: {results}")
+    return results
+
+
+def scrape_protocols():
+    print(f"\nScraping DeBank protocol positions...")
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(DEBANK_URL_PROTOCOLS, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    # DeBank protocol section layout:
+    # ProtocolName / $summary / Subtitle / Pool / Balance / [Rewards] / USD Value / position name / amounts / Withdraw / [rewards] / [Claim] / $detail
+    # The detail value is the FIRST $-prefixed line AFTER the subtitle (Farming/Staked).
+    targets = [("curve", "Curve", "Farming"), ("convex", "Convex", "Staked")]
+
+    for key, header, subtitle in targets:
+        for i, line in enumerate(lines):
+            if line == header and i + 2 < len(lines) and lines[i + 2] == subtitle:
+                for j in range(i + 3, min(i + 25, len(lines))):
+                    if lines[j].startswith('$'):
+                        val_str = lines[j].replace('$', '').replace(',', '').strip()
+                        try:
+                            results[key] = float(val_str)
+                            print(f"  {key} ({header} {subtitle}): ${results[key]:,.2f}")
+                            break
+                        except ValueError:
+                            continue
+                break
+        if key not in results:
+            print(f"  Missing: {key} ({header} {subtitle})")
+
+    return results
+
+
+def fetch_dusd_supply():
+    print(f"\nFetching dUSD supply...")
+    r = requests.get(ETHERSCAN_V2_URL, params={
+        "chainid": FRAXTAL_CHAIN_ID,
+        "module": "stats",
+        "action": "tokensupply",
+        "contractaddress": DUSD_CONTRACT,
+        "apikey": ETHERSCAN_API_KEY,
+    }, timeout=15).json()
+    if r.get("status") == "1":
+        s = int(r["result"]) / 1_000_000
+        print(f"  dUSD: {s:,.6f}")
+        return s
+    print(f"  Error: {r}")
+    return None
+
+
+def scrape_debank_katana():
+    print(f"\nScraping DeBank (Katana wallet)...")
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(DEBANK_URL_KATANA, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    target_tokens = list(KATANA_TOKEN_ROW_MAP.keys())
+
+    for i, line in enumerate(lines):
+        ll = line.lower().strip()
+        for key in target_tokens:
+            if key in results:
+                continue
+            if ll == key:
+                upcoming = lines[i+1:i+5]
+                usd_values = []
+                for upcoming_line in upcoming:
+                    if upcoming_line.startswith('<$'):
+                        # DeBank shows "<$0.01" for sub-cent positions
+                        usd_values.append(0.0)
+                    elif upcoming_line.startswith('$'):
+                        val_str = upcoming_line.replace('$', '').replace(',', '').strip()
+                        try:
+                            val = float(val_str)
+                            if val > 0:
+                                usd_values.append(val)
+                        except ValueError:
+                            pass
+                if len(usd_values) >= 2:
+                    results[key] = usd_values[1]
+                    print(f"  {key}: ${usd_values[1]:,.2f}")
+                elif usd_values:
+                    results[key] = usd_values[0]
+                    print(f"  {key}: ${usd_values[0]:,.2f} (only one $ found, may be wrong)")
+
+    print(f"  Results: {results}")
+    return results
+
+
+def fetch_dusd_supply_katana():
+    print(f"\nFetching dUSD supply (Katana)...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(KATANASCAN_DUSD_URL, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    for i, line in enumerate(lines):
+        if line.upper() == "MAX TOTAL SUPPLY" and i + 1 < len(lines):
+            val_str = lines[i + 1].replace(',', '').strip()
+            try:
+                supply = float(val_str)
+                print(f"  dUSD (Katana): {supply:,.6f}")
+                return supply
+            except ValueError:
+                pass
+
+    print(f"  Error: Max Total Supply not found")
+    return None
+
+
+def write_to_katana_sheet(katana_data, katana_dusd_supply):
+    print(f"\nWriting to Katana sheet...")
+    creds = _load_google_credentials()
+    sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(KATANA_SHEET_TAB)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    row2 = sheet.row_values(2)
+    col = next((i+1 for i, c in enumerate(row2) if str(c).strip() == today_str), len(row2)+1)
+    col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+    print(f"  Column: {col_letter} (index {col}) for {today_str}")
+
+    if col > sheet.col_count:
+        sheet.add_cols(col - sheet.col_count)
+        print(f"  Expanded sheet to {col} columns")
+
+    updates = []
+    if not sheet.cell(2, col).value:
+        updates.append({"range": gspread.utils.rowcol_to_a1(2, col), "values": [[today_str]]})
+
+    for k, r in KATANA_TOKEN_ROW_MAP.items():
+        if k in katana_data:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, col), "values": [[katana_data[k]]]})
+            print(f"  Row {r} ({k}): ${katana_data[k]:,.2f}")
+        else:
+            print(f"  Missing: {k}")
+
+    if katana_dusd_supply is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(KATANA_DUSD_ROW, col), "values": [[katana_dusd_supply]]})
+        print(f"  Row {KATANA_DUSD_ROW} (dUSD): {katana_dusd_supply:,.6f}")
+
+    # Formulas: Row 11 = SUM(3:8), Row 12 = SUM(9), Row 14 = 11/12
+    updates.append({"range": gspread.utils.rowcol_to_a1(11, col), "values": [[f"=SUM({col_letter}3:{col_letter}8)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(12, col), "values": [[f"=SUM({col_letter}9)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(14, col), "values": [[f"={col_letter}11/{col_letter}12"]]})
+
+    if updates:
+        sheet.batch_update(updates, value_input_option='USER_ENTERED')
+        # Copy formatting (borders, $/% number formats, etc.) from template col B
+        sheet.spreadsheet.batch_update({'requests': [{
+            'copyPaste': {
+                'source':      {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 20, 'startColumnIndex': 1, 'endColumnIndex': 2},
+                'destination': {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 20, 'startColumnIndex': col - 1, 'endColumnIndex': col},
+                'pasteType': 'PASTE_FORMAT', 'pasteOrientation': 'NORMAL',
+            }
+        }]})
+        sheet.format(f"{col_letter}14", {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+        print(f"  Wrote {len(updates)} values + format copy + % format on {col_letter}14")
+    else:
+        print("  Nothing to write.")
+
+
+def scrape_debank_ethereum():
+    print(f"\nScraping DeBank (Ethereum wallet)...")
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(DEBANK_URL_ETHEREUM, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    # Raw wallet tokens (Token / $Price / Amount / $USD pattern)
+    raw_keys = list(ETHEREUM_RAW_TOKEN_ROW_MAP.keys())
+    for i, line in enumerate(lines):
+        ll = line.lower().strip()
+        for key in raw_keys:
+            if key in results:
+                continue
+            if ll == key:
+                upcoming = lines[i+1:i+5]
+                usd_values = []
+                for upcoming_line in upcoming:
+                    if upcoming_line.startswith('<$'):
+                        usd_values.append(0.0)
+                    elif upcoming_line.startswith('$'):
+                        val_str = upcoming_line.replace('$', '').replace(',', '').strip()
+                        try:
+                            val = float(val_str)
+                            if val > 0:
+                                usd_values.append(val)
+                        except ValueError:
+                            pass
+                if len(usd_values) >= 2:
+                    results[key] = usd_values[1]
+                    print(f"  {key}: ${usd_values[1]:,.2f}")
+                elif usd_values:
+                    results[key] = usd_values[0]
+                    print(f"  {key}: ${usd_values[0]:,.2f} (only one $ found)")
+
+    # Protocol positions (Frax Staked sfrxUSD, Sky Yield Savings USDS)
+    for key, _row, header, subtitle in ETHEREUM_PROTOCOL_POSITIONS:
+        for i, line in enumerate(lines):
+            if line == header and i + 2 < len(lines) and lines[i + 2] == subtitle:
+                for j in range(i + 3, min(i + 25, len(lines))):
+                    if lines[j].startswith('$'):
+                        val_str = lines[j].replace('$', '').replace(',', '').strip()
+                        try:
+                            results[key] = float(val_str)
+                            print(f"  {key} ({header} {subtitle}): ${results[key]:,.2f}")
+                            break
+                        except ValueError:
+                            continue
+                break
+        if key not in results:
+            print(f"  Missing: {key} ({header} {subtitle})")
+
+    print(f"  Results: {results}")
+    return results
+
+
+def scrape_amo_ethereum():
+    print(f"\nScraping DeBank (AMO wallet, Ethereum)...")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(DEBANK_URL_AMO_ETHEREUM, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    for i, line in enumerate(lines):
+        if line == "Curve" and i + 2 < len(lines) and lines[i + 2] == "Farming":
+            for j in range(i + 3, min(i + 25, len(lines))):
+                if lines[j].startswith('$'):
+                    val_str = lines[j].replace('$', '').replace(',', '').strip()
+                    try:
+                        val = float(val_str)
+                        print(f"  AMO Curve LP: ${val:,.2f}")
+                        return val
+                    except ValueError:
+                        continue
+            break
+
+    print(f"  Error: Curve Farming position not found")
+    return None
+
+
+def fetch_dusd_supply_ethereum():
+    print(f"\nFetching dUSD supply (Ethereum)...")
+    r = requests.get(ETHERSCAN_V2_URL, params={
+        "chainid": ETHEREUM_CHAIN_ID,
+        "module": "stats",
+        "action": "tokensupply",
+        "contractaddress": DUSD_CONTRACT_ETHEREUM,
+        "apikey": ETHERSCAN_API_KEY,
+    }, timeout=15).json()
+    if r.get("status") == "1":
+        raw = int(r["result"])
+        # Try 18 decimals first (most ERC-20 stablecoins on Ethereum), check magnitude
+        s_18 = raw / 10**18
+        s_6 = raw / 10**6
+        # Pick the one that lands in a reasonable token-supply range (1k–1B)
+        s = s_18 if 1_000 <= s_18 <= 1_000_000_000 else s_6
+        print(f"  dUSD (Ethereum): {s:,.6f}  (raw={raw}, 18dec={s_18:,.6f}, 6dec={s_6:,.6f})")
+        return s
+    print(f"  Error: {r}")
+    return None
+
+
+def fetch_token_supply_fraxtal(contract, decimals, label):
+    """Fetch raw token supply from Etherscan v2 (Fraxtal chain), divide by 10**decimals."""
+    r = requests.get(ETHERSCAN_V2_URL, params={
+        "chainid": FRAXTAL_CHAIN_ID,
+        "module": "stats",
+        "action": "tokensupply",
+        "contractaddress": contract,
+        "apikey": ETHERSCAN_API_KEY,
+    }, timeout=15).json()
+    if r.get("status") == "1":
+        raw = int(r["result"])
+        scaled = raw / 10**decimals
+        print(f"  {label}: {scaled:,.6f} (decimals={decimals})")
+        return scaled
+    print(f"  Error fetching {label}: {r}")
+    return None
+
+
+def fetch_frxeth_price():
+    print(f"\nFetching frxETH price (CoinGecko)...")
+    try:
+        r = requests.get(COINGECKO_FRXETH_URL, timeout=15).json()
+        price = r.get("frax-ether", {}).get("usd")
+        if price:
+            print(f"  frxETH price: ${price:,.2f}")
+            return float(price)
+        print(f"  Error: no price in response: {r}")
+    except Exception as e:
+        print(f"  Error: {e}")
+    return None
+
+
+def fetch_coingecko_prices(ids):
+    """Batch-fetch USD prices from CoinGecko. Returns dict {id: price}."""
+    if not ids:
+        return {}
+    print(f"\nFetching CoinGecko prices for: {ids}")
+    try:
+        r = requests.get(COINGECKO_PRICE_URL, params={"ids": ",".join(ids), "vs_currencies": "usd"}, timeout=20).json()
+        prices = {k: v.get("usd") for k, v in r.items() if v.get("usd") is not None}
+        for k in ids:
+            if k in prices:
+                print(f"  {k}: ${prices[k]}")
+            else:
+                print(f"  {k}: MISSING (will default to $1.00)")
+        return prices
+    except Exception as e:
+        print(f"  Error: {e}")
+        return {}
+
+
+def fetch_fxb_prices_via_ytm():
+    """Scrape facts.frax.finance/fxb table for YTM, compute price = 1/(1+YTM)^t per maturity."""
+    print(f"\nFetching FXB YTMs from {FRAX_FACTS_FXB_URL}...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ).new_page()
+        page.goto(FRAX_FACTS_FXB_URL, wait_until="networkidle", timeout=60000)
+        time.sleep(8)
+        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+        browser.close()
+
+    # Table rows: "FXB YYYY-MM-DD" → next line is maturity duration → next is YTM → next is supply
+    today = datetime.now()
+    prices = {}  # key: "YYYY-MM-DD" → price
+    for i, line in enumerate(lines):
+        if line.startswith("FXB ") and len(line) >= 14 and "-" in line:
+            mat_str = line[4:14]  # "YYYY-MM-DD"
+            try:
+                mat_date = datetime.strptime(mat_str, "%Y-%m-%d")
+            except ValueError:
+                continue
+            # YTM is 2 lines after the FXB line (skipping maturity-in line)
+            if i + 2 < len(lines) and lines[i + 2].endswith('%'):
+                try:
+                    ytm = float(lines[i + 2].rstrip('%')) / 100.0
+                except ValueError:
+                    continue
+                t_years = max((mat_date - today).days / 365.25, 0)
+                if t_years <= 0:
+                    price = 1.0  # matured
+                else:
+                    price = 1.0 / ((1 + ytm) ** t_years)
+                prices[mat_str] = price
+                print(f"  FXB {mat_str}: YTM={ytm:.4f}, t={t_years:.2f}yr → price=${price:.4f}")
+    return prices
+
+
+def fetch_dlend_fraxtal():
+    print(f"\nFetching dLEND token supplies (Fraxtal)...")
+
+    # Existing rows
+    dusd  = fetch_token_supply_fraxtal(DLEND_DUSD_CONTRACT,   6,  "dLEND dUSD supply  (row 4)")
+    sdusd = fetch_token_supply_fraxtal(DLEND_SDUSD_CONTRACT,  6,  "dLEND sdUSD supply (row 19)")
+
+    # Extra rows — fetch all supplies first
+    supplies = {}  # row → (symbol, supply, decimals, coingecko_id_or_FXB)
+    for row, (sym, contract, decimals, cg_id) in DLEND_EXTRA_TOKENS.items():
+        supply = fetch_token_supply_fraxtal(contract, decimals, f"  row {row} {sym}")
+        supplies[row] = (sym, supply, cg_id)
+
+    # Batch-fetch CoinGecko prices for non-FXB tokens (plus frax-ether for row 6)
+    cg_ids = sorted({cg_id for (_, _, cg_id) in supplies.values() if cg_id and not cg_id.startswith("FXB:")} | {"frax-ether"})
+    cg_prices = fetch_coingecko_prices(cg_ids)
+
+    # Fetch FXB prices via YTM scrape
+    fxb_prices = fetch_fxb_prices_via_ytm() if any(cg_id and cg_id.startswith("FXB:") for (_, _, cg_id) in supplies.values()) else {}
+
+    # Compute USD value for each row
+    usd_values = {}
+    for row, (sym, supply, cg_id) in supplies.items():
+        if supply is None:
+            usd_values[row] = None
+            continue
+        if cg_id is None:
+            price = 1.0
+            print(f"  Row {row} {sym}: ${supply:,.2f} × $1.00 (default) = ${supply:,.2f}")
+        elif cg_id.startswith("FXB:"):
+            mat = cg_id.split(":", 1)[1]
+            price = fxb_prices.get(mat, 1.0)  # fallback $1 face value if missing (e.g., matured FXB 2025)
+            print(f"  Row {row} {sym}: {supply:,.4f} × ${price:.4f} = ${supply * price:,.2f}")
+        else:
+            price = cg_prices.get(cg_id, 1.0)
+            print(f"  Row {row} {sym}: {supply:,.4f} × ${price} = ${supply * price:,.2f}")
+        usd_values[row] = supply * price
+
+    # frxETH (row 6) — special case: CoinGecko price for frax-ether
+    frxeth_supply = fetch_token_supply_fraxtal(DLEND_FRXETH_CONTRACT, 18, "  row 6 frxETH (tokens)")
+    frxeth_price = cg_prices.get("frax-ether") or fetch_frxeth_price()
+    frxeth_usd = (frxeth_supply * frxeth_price) if (frxeth_supply is not None and frxeth_price) else None
+    if frxeth_usd is not None:
+        print(f"  Row 6 frxETH: {frxeth_supply:,.6f} × ${frxeth_price:,.2f} = ${frxeth_usd:,.2f}")
+
+    return {
+        "dusd": dusd,
+        "frxeth_usd": frxeth_usd,
+        "sdusd": sdusd,
+        "extra_rows": usd_values,
+    }
+
+
+def fetch_token_supply_chain(chain_id, contract, decimals, label):
+    """Same as fetch_token_supply_fraxtal but parameterized chain."""
+    r = requests.get(ETHERSCAN_V2_URL, params={
+        "chainid": chain_id,
+        "module": "stats",
+        "action": "tokensupply",
+        "contractaddress": contract,
+        "apikey": ETHERSCAN_API_KEY,
+    }, timeout=15).json()
+    if r.get("status") == "1":
+        raw = int(r["result"])
+        scaled = raw / 10**decimals
+        print(f"  {label}: {scaled:,.6f} (decimals={decimals})")
+        return scaled
+    print(f"  Error fetching {label}: {r}")
+    return None
+
+
+def fetch_dlend_ethereum():
+    print(f"\nFetching dLEND token supplies (Ethereum)...")
+    dusd      = fetch_token_supply_chain(ETHEREUM_CHAIN_ID, DLEND_ETHEREUM_DUSD_CONTRACT,      18, "dLEND dUSD supply (row 3)")
+    dusd_debt = fetch_token_supply_chain(ETHEREUM_CHAIN_ID, DLEND_ETHEREUM_DUSD_DEBT_CONTRACT, 18, "dLEND dUSD debt   (row 19)")
+
+    supplies = {}
+    for row, (sym, contract, decimals, cg_id) in DLEND_ETHEREUM_EXTRA_TOKENS.items():
+        supply = fetch_token_supply_chain(ETHEREUM_CHAIN_ID, contract, decimals, f"  row {row} {sym}")
+        supplies[row] = (sym, supply, cg_id)
+
+    cg_ids = sorted({cg_id for (_, _, cg_id) in supplies.values() if cg_id and cg_id != "ZERO"})
+    cg_prices = fetch_coingecko_prices(cg_ids)
+
+    usd_values = {}
+    for row, (sym, supply, cg_id) in supplies.items():
+        if supply is None:
+            usd_values[row] = None
+            continue
+        if cg_id == "ZERO":
+            usd_values[row] = 0.0
+            print(f"  Row {row} {sym}: forced $0.00")
+            continue
+        price = cg_prices.get(cg_id, 1.0) if cg_id else 1.0
+        usd_values[row] = supply * price
+        print(f"  Row {row} {sym}: {supply:,.6f} × ${price} = ${usd_values[row]:,.2f}")
+
+    return {"dusd": dusd, "dusd_debt": dusd_debt, "extra_rows": usd_values}
+
+
+def write_to_dlend_ethereum_sheet(data):
+    print(f"\nWriting to dLEND Stats (Ethereum) sheet...")
+    creds = _load_google_credentials()
+    sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(DLEND_ETHEREUM_SHEET_TAB)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    row_dates = sheet.row_values(DLEND_ETHEREUM_DATE_ROW)
+    col = next((i+1 for i, c in enumerate(row_dates) if str(c).strip() == today_str), len(row_dates)+1)
+    col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+    print(f"  Column: {col_letter} (index {col}) for {today_str}")
+
+    if col > sheet.col_count:
+        sheet.add_cols(col - sheet.col_count)
+        print(f"  Expanded sheet to {col} columns")
+
+    updates = []
+    if not sheet.cell(DLEND_ETHEREUM_DATE_ROW, col).value:
+        updates.append({"range": gspread.utils.rowcol_to_a1(DLEND_ETHEREUM_DATE_ROW, col), "values": [[today_str]]})
+
+    if data.get("dusd") is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(3, col), "values": [[round(data["dusd"], 2)]]})
+        print(f"  Row 3 (dUSD Supply): ${data['dusd']:,.2f}")
+
+    for row, usd in (data.get("extra_rows") or {}).items():
+        if usd is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(row, col), "values": [[round(usd, 2)]]})
+            print(f"  Row {row}: ${usd:,.2f}")
+
+    if data.get("dusd_debt") is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(19, col), "values": [[round(data["dusd_debt"], 2)]]})
+        print(f"  Row 19 (dUSD Debt): ${data['dusd_debt']:,.2f}")
+
+    # Formulas matching historical pattern: SUM(B4:B16), B23-B24, SUM(B3:B16), B19/B3, B19/B18
+    updates.append({"range": gspread.utils.rowcol_to_a1(18, col), "values": [[f"=SUM({col_letter}4:{col_letter}16)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(25, col), "values": [[f"={col_letter}23-{col_letter}24"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(27, col), "values": [[f"=SUM({col_letter}3:{col_letter}16)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(28, col), "values": [[f"={col_letter}19/{col_letter}3"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(29, col), "values": [[f"={col_letter}19/{col_letter}18"]]})
+
+    if updates:
+        sheet.batch_update(updates, value_input_option='USER_ENTERED')
+        # Copy formatting from template col B
+        sheet.spreadsheet.batch_update({'requests': [{
+            'copyPaste': {
+                'source':      {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 30, 'startColumnIndex': 1, 'endColumnIndex': 2},
+                'destination': {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 30, 'startColumnIndex': col - 1, 'endColumnIndex': col},
+                'pasteType': 'PASTE_FORMAT', 'pasteOrientation': 'NORMAL',
+            }
+        }]})
+        print(f"  Wrote {len(updates)} values + format copy from col B")
+    else:
+        print("  Nothing to write.")
+
+
+def write_to_dlend_fraxtal_sheet(data):
+    print(f"\nWriting to dLEND Stats (Fraxtal) sheet...")
+    creds = _load_google_credentials()
+    sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(DLEND_FRAXTAL_SHEET_TAB)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    row3 = sheet.row_values(3)
+    col = next((i+1 for i, c in enumerate(row3) if str(c).strip() == today_str), len(row3)+1)
+    col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+    print(f"  Column: {col_letter} (index {col}) for {today_str}")
+
+    if col > sheet.col_count:
+        sheet.add_cols(col - sheet.col_count)
+        print(f"  Expanded sheet to {col} columns")
+
+    updates = []
+    if not sheet.cell(3, col).value:
+        updates.append({"range": gspread.utils.rowcol_to_a1(3, col), "values": [[today_str]]})
+
+    if data.get("dusd") is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(4, col), "values": [[round(data["dusd"], 2)]]})
+        print(f"  Row 4 (dUSD Supply): ${data['dusd']:,.2f}")
+    else:
+        print(f"  Missing: dUSD")
+
+    if data.get("frxeth_usd") is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(6, col), "values": [[round(data["frxeth_usd"], 2)]]})
+        print(f"  Row 6 (frxETH Supply, USD): ${data['frxeth_usd']:,.2f}")
+    else:
+        print(f"  Missing: frxETH")
+
+    if data.get("sdusd") is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(19, col), "values": [[round(data["sdusd"], 2)]]})
+        print(f"  Row 19 (sdUSD Supply): ${data['sdusd']:,.2f}")
+    else:
+        print(f"  Missing: sdUSD")
+
+    # Extra rows (5, 7-16) — USD values from supply × price
+    for row, usd in (data.get("extra_rows") or {}).items():
+        if usd is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(row, col), "values": [[round(usd, 2)]]})
+            print(f"  Row {row}: ${usd:,.2f}")
+        else:
+            print(f"  Missing: row {row}")
+
+    # Formulas matching historical pattern
+    updates.append({"range": gspread.utils.rowcol_to_a1(18, col), "values": [[f"=SUM({col_letter}5:{col_letter}8)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(25, col), "values": [[f"={col_letter}23-{col_letter}24"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(27, col), "values": [[f"=SUM({col_letter}4:{col_letter}16)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(28, col), "values": [[f"={col_letter}19/{col_letter}4"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(29, col), "values": [[f"={col_letter}19/{col_letter}18"]]})
+
+    if updates:
+        sheet.batch_update(updates, value_input_option='USER_ENTERED')
+        # Copy formatting (borders, $/% formats, etc.) from template col B
+        sheet.spreadsheet.batch_update({'requests': [{
+            'copyPaste': {
+                'source':      {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 30, 'startColumnIndex': 1, 'endColumnIndex': 2},
+                'destination': {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 30, 'startColumnIndex': col - 1, 'endColumnIndex': col},
+                'pasteType': 'PASTE_FORMAT', 'pasteOrientation': 'NORMAL',
+            }
+        }]})
+        print(f"  Wrote {len(updates)} values + format copy from col B")
+    else:
+        print("  Nothing to write.")
+
+
+def write_to_ethereum_sheet(eth_data, eth_dusd_supply, amo_value):
+    print(f"\nWriting to Ethereum sheet...")
+    creds = _load_google_credentials()
+    sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(ETHEREUM_SHEET_TAB)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    row3 = sheet.row_values(3)
+    col = next((i+1 for i, c in enumerate(row3) if str(c).strip() == today_str), len(row3)+1)
+    col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+    print(f"  Column: {col_letter} (index {col}) for {today_str}")
+
+    if col > sheet.col_count:
+        sheet.add_cols(col - sheet.col_count)
+        print(f"  Expanded sheet to {col} columns")
+
+    updates = []
+    if not sheet.cell(3, col).value:
+        updates.append({"range": gspread.utils.rowcol_to_a1(3, col), "values": [[today_str]]})
+
+    # Raw tokens
+    for k, r in ETHEREUM_RAW_TOKEN_ROW_MAP.items():
+        if k in eth_data:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, col), "values": [[eth_data[k]]]})
+            print(f"  Row {r} ({k}): ${eth_data[k]:,.2f}")
+        else:
+            print(f"  Missing: {k}")
+
+    # Protocol positions
+    for key, r, _h, _s in ETHEREUM_PROTOCOL_POSITIONS:
+        if key in eth_data:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, col), "values": [[eth_data[key]]]})
+            print(f"  Row {r} ({key}): ${eth_data[key]:,.2f}")
+        else:
+            print(f"  Missing: {key}")
+
+    # AMO dUSD (row 10)
+    if amo_value is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(ETHEREUM_AMO_ROW, col), "values": [[amo_value]]})
+        print(f"  Row {ETHEREUM_AMO_ROW} (AMO Curve LP): ${amo_value:,.2f}")
+    else:
+        print(f"  Missing: AMO")
+
+    # dUSD supply (row 11)
+    if eth_dusd_supply is not None:
+        updates.append({"range": gspread.utils.rowcol_to_a1(ETHEREUM_DUSD_ROW, col), "values": [[eth_dusd_supply]]})
+        print(f"  Row {ETHEREUM_DUSD_ROW} (dUSD): ${eth_dusd_supply:,.2f}")
+    else:
+        print(f"  Missing: dUSD supply")
+
+    # Formulas: Row 13 = SUM(4:10), Row 14 = Row 11, Row 16 = Row 13 / Row 14
+    updates.append({"range": gspread.utils.rowcol_to_a1(13, col), "values": [[f"=SUM({col_letter}4:{col_letter}10)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(14, col), "values": [[f"={col_letter}11"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(16, col), "values": [[f"={col_letter}13/{col_letter}14"]]})
+
+    if updates:
+        sheet.batch_update(updates, value_input_option='USER_ENTERED')
+        # Copy formatting (borders, $/% number formats, etc.) from template col C
+        sheet.spreadsheet.batch_update({'requests': [{
+            'copyPaste': {
+                'source':      {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 20, 'startColumnIndex': 2, 'endColumnIndex': 3},
+                'destination': {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 20, 'startColumnIndex': col - 1, 'endColumnIndex': col},
+                'pasteType': 'PASTE_FORMAT', 'pasteOrientation': 'NORMAL',
+            }
+        }]})
+        sheet.format(f"{col_letter}16", {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+        print(f"  Wrote {len(updates)} values + format copy + % format on {col_letter}16")
+    else:
+        print("  Nothing to write.")
+
+
+def write_to_sheet(debank_data, dusd_supply, protocol_data):
+    print(f"\nWriting to Google Sheet...")
+    creds = _load_google_credentials()
+    sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(SHEET_TAB_NAME)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    row3 = sheet.row_values(3)
+    col = next((i+1 for i, c in enumerate(row3) if str(c).strip() == today_str), len(row3)+1)
+    col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+    print(f"  Column: {col_letter} (index {col}) for {today_str}")
+
+    if col > sheet.col_count:
+        sheet.add_cols(col - sheet.col_count)
+        print(f"  Expanded sheet to {col} columns")
+
+    updates = []
+    if not sheet.cell(3, col).value:
+        updates.append({"range": gspread.utils.rowcol_to_a1(3, col), "values": [[today_str]]})
+
+    for k, r in TOKEN_ROW_MAP.items():
+        if k in debank_data:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, col), "values": [[debank_data[k]]]})
+            print(f"  Row {r} ({k}): ${debank_data[k]:,.2f}")
+        else:
+            print(f"  Missing: {k}")
+
+    if "convex" in protocol_data:
+        updates.append({"range": gspread.utils.rowcol_to_a1(CONVEX_ROW, col), "values": [[protocol_data["convex"]]]})
+        print(f"  Row {CONVEX_ROW} (Convex dUSD+sfrxUSD): ${protocol_data['convex']:,.2f}")
+    else:
+        print(f"  Missing: convex")
+
+    if "curve" in protocol_data:
+        updates.append({"range": gspread.utils.rowcol_to_a1(CURVE_ROW, col), "values": [[protocol_data["curve"]]]})
+        print(f"  Row {CURVE_ROW} (Curve dUSD/sFRAX): ${protocol_data['curve']:,.2f}")
+    else:
+        print(f"  Missing: curve")
+
+    if dusd_supply:
+        updates.append({"range": gspread.utils.rowcol_to_a1(DUSD_ROW, col), "values": [[dusd_supply]]})
+        print(f"  Row {DUSD_ROW} (dUSD): {dusd_supply:,.6f}")
+
+    # Formulas: Row 18 = SUM(4:15), Row 19 = Row 16, Row 21 = Row 18 / Row 19
+    updates.append({"range": gspread.utils.rowcol_to_a1(18, col), "values": [[f"=SUM({col_letter}4:{col_letter}15)"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(19, col), "values": [[f"={col_letter}16"]]})
+    updates.append({"range": gspread.utils.rowcol_to_a1(21, col), "values": [[f"={col_letter}18/{col_letter}19"]]})
+
+    if updates:
+        sheet.batch_update(updates, value_input_option='USER_ENTERED')
+        # Copy formatting (borders, $/% number formats, etc.) from template col C
+        sheet.spreadsheet.batch_update({'requests': [{
+            'copyPaste': {
+                'source':      {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 25, 'startColumnIndex': 2, 'endColumnIndex': 3},
+                'destination': {'sheetId': sheet.id, 'startRowIndex': 0, 'endRowIndex': 25, 'startColumnIndex': col - 1, 'endColumnIndex': col},
+                'pasteType': 'PASTE_FORMAT', 'pasteOrientation': 'NORMAL',
+            }
+        }]})
+        sheet.format(f"{col_letter}21", {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+        print(f"  Wrote {len(updates)} values + format copy + % format on {col_letter}21")
+    else:
+        print("  Nothing to write.")
+
+
+def _run_fraxtal_balance():
+    write_to_sheet(scrape_debank(), fetch_dusd_supply(), scrape_protocols())
+
+def _run_katana_balance():
+    write_to_katana_sheet(scrape_debank_katana(), fetch_dusd_supply_katana())
+
+def _run_ethereum_balance():
+    write_to_ethereum_sheet(scrape_debank_ethereum(), fetch_dusd_supply_ethereum(), scrape_amo_ethereum())
+
+def _run_dlend_fraxtal():
+    write_to_dlend_fraxtal_sheet(fetch_dlend_fraxtal())
+
+def _run_dlend_ethereum():
+    write_to_dlend_ethereum_sheet(fetch_dlend_ethereum())
+
+
+def main():
+    print("="*50)
+    print(f"dTRINITY Scraper | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*50)
+    started = time.time()
+
+    tasks = {
+        "Fraxtal balance":  _run_fraxtal_balance,
+        "Katana balance":   _run_katana_balance,
+        "Ethereum balance": _run_ethereum_balance,
+        "dLEND Fraxtal":    _run_dlend_fraxtal,
+        "dLEND Ethereum":   _run_dlend_ethereum,
+    }
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+        futures = {ex.submit(fn): name for name, fn in tasks.items()}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+                print(f"\n[OK] {name}")
+            except Exception as e:
+                print(f"\n[FAIL] {name}: {type(e).__name__}: {e}")
+                failures.append(name)
+
+    elapsed = time.time() - started
+    print(f"\n{'='*50}")
+    print(f"Done in {elapsed:.1f}s. {len(tasks) - len(failures)}/{len(tasks)} sheets succeeded.")
+    if failures:
+        print(f"Failures: {', '.join(failures)}")
+    print(f"{'='*50}")
+
+if __name__ == "__main__":
+    main()
