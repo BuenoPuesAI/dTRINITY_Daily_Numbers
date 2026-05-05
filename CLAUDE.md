@@ -64,6 +64,8 @@ If the user changes any of these wallet addresses, both the constant and the cor
 ### Verify-and-retry pass at the end of `main()`
 After the parallel scrape, `main()` runs `verify_today()` to read today's column on each sheet and compare against `EXPECTED_SHEET_ROWS`. Any sheet with a blank in an expected row gets re-run (up to `MAX_VERIFY_ATTEMPTS = 2` retry passes). A cell counting `0`/`$0.00` is treated as **present** (intentional zeros like cbBTC). A truly empty cell is treated as **missing**. If anything is still missing after the retries, `main()` exits non-zero so the GitHub Action fails visibly.
 
+There is a `RETRY_DELAY_SECONDS` sleep (default 3600 = 1 hour) **before** each retry, so transient rate-limits / DeBank flakes have time to clear. Override via env var for local debugging: `RETRY_DELAY_SECONDS=0 .venv/bin/python scraper.py`. The GitHub Action's `timeout-minutes` was bumped to 180 to accommodate worst-case 2hr 15min runs (scrape + 1hr + retry + 1hr + retry).
+
 When adding a new data row to any sheet, also add its row number to that sheet's entry in `EXPECTED_SHEET_ROWS` — otherwise the verification pass won't notice when it goes missing.
 
 ### Sheet column count vs. row_values length

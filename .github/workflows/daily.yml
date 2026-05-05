@@ -10,7 +10,9 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Bumped from 15 to 180 because main() now sleeps 1hr before each retry
+    # (RETRY_DELAY_SECONDS in scraper.py). Worst case: scrape + 1hr + retry + 1hr + retry ≈ 2hr 15min.
+    timeout-minutes: 180
 
     steps:
       - name: Checkout

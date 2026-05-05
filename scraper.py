@@ -1057,6 +1057,9 @@ def verify_today(sheet_filter=None):
 
 
 MAX_VERIFY_ATTEMPTS = 2
+# Sleep this many seconds before each retry so transient rate-limits / DeBank flakes
+# have time to clear. Override via env var for local runs (e.g. RETRY_DELAY_SECONDS=0).
+RETRY_DELAY_SECONDS = int(os.environ.get("RETRY_DELAY_SECONDS", "3600"))
 
 
 def main():
@@ -1094,6 +1097,9 @@ def main():
         if not misses:
             print("[OK] All expected rows populated.")
             break
+        if RETRY_DELAY_SECONDS > 0:
+            print(f"[VERIFY] {len(misses)} sheet(s) have misses. Sleeping {RETRY_DELAY_SECONDS}s ({RETRY_DELAY_SECONDS/60:.0f}m) before retry to let rate-limits clear...")
+            time.sleep(RETRY_DELAY_SECONDS)
         print(f"[VERIFY] Retrying sheets: {list(misses.keys())}")
         with ThreadPoolExecutor(max_workers=len(misses)) as ex:
             futures = {ex.submit(EXPECTED_SHEET_ROWS[tab]["rerun"]): tab for tab in misses}
