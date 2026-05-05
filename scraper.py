@@ -1,10 +1,44 @@
-import os, re, time, json, requests
+import os, re, time, json, threading, requests
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 import gspread
 from google.oauth2.service_account import Credentials
+
+# Etherscan v2 free tier allows 5 req/sec but reports rate-limit errors at 3/sec under load.
+# Throttle globally to ~2.5/sec to stay safe across parallel sheets.
+_etherscan_lock = threading.Lock()
+_etherscan_last_call_t = [0.0]
+ETHERSCAN_MIN_INTERVAL = 0.4
+
+def _etherscan_get(params, max_retries=4):
+    """Throttled + retrying GET against the Etherscan v2 API."""
+    last = None
+    for attempt in range(max_retries):
+        with _etherscan_lock:
+            elapsed = time.time() - _etherscan_last_call_t[0]
+            if elapsed < ETHERSCAN_MIN_INTERVAL:
+                time.sleep(ETHERSCAN_MIN_INTERVAL - elapsed)
+            _etherscan_last_call_t[0] = time.time()
+        try:
+            r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20).json()
+            last = r
+            if r.get("status") == "1":
+                return r
+            msg = str(r.get("result", "")) + str(r.get("message", ""))
+            if "rate limit" in msg.lower() or "max calls" in msg.lower():
+                wait = (attempt + 1) * 1.5
+                print(f"  [throttle] rate limited, sleeping {wait:.1f}s before retry {attempt+1}/{max_retries}")
+                time.sleep(wait)
+                continue
+            return r
+        except Exception as e:
+            print(f"  [throttle] request error attempt {attempt+1}: {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+    return last
 
 # Load .env from script directory if present (local-run convenience; not used in GH Actions)
 _env_path = Path(__file__).parent / ".env"
@@ -239,14 +273,14 @@ def scrape_protocols():
 
 def fetch_dusd_supply():
     print(f"\nFetching dUSD supply...")
-    r = requests.get(ETHERSCAN_V2_URL, params={
+    r = _etherscan_get({
         "chainid": FRAXTAL_CHAIN_ID,
         "module": "stats",
         "action": "tokensupply",
         "contractaddress": DUSD_CONTRACT,
         "apikey": ETHERSCAN_API_KEY,
-    }, timeout=15).json()
-    if r.get("status") == "1":
+    })
+    if r and r.get("status") == "1":
         s = int(r["result"]) / 1_000_000
         print(f"  dUSD: {s:,.6f}")
         return s
@@ -474,14 +508,14 @@ def scrape_amo_ethereum():
 
 def fetch_dusd_supply_ethereum():
     print(f"\nFetching dUSD supply (Ethereum)...")
-    r = requests.get(ETHERSCAN_V2_URL, params={
+    r = _etherscan_get({
         "chainid": ETHEREUM_CHAIN_ID,
         "module": "stats",
         "action": "tokensupply",
         "contractaddress": DUSD_CONTRACT_ETHEREUM,
         "apikey": ETHERSCAN_API_KEY,
-    }, timeout=15).json()
-    if r.get("status") == "1":
+    })
+    if r and r.get("status") == "1":
         raw = int(r["result"])
         # Try 18 decimals first (most ERC-20 stablecoins on Ethereum), check magnitude
         s_18 = raw / 10**18
@@ -496,14 +530,14 @@ def fetch_dusd_supply_ethereum():
 
 def fetch_token_supply_fraxtal(contract, decimals, label):
     """Fetch raw token supply from Etherscan v2 (Fraxtal chain), divide by 10**decimals."""
-    r = requests.get(ETHERSCAN_V2_URL, params={
+    r = _etherscan_get({
         "chainid": FRAXTAL_CHAIN_ID,
         "module": "stats",
         "action": "tokensupply",
         "contractaddress": contract,
         "apikey": ETHERSCAN_API_KEY,
-    }, timeout=15).json()
-    if r.get("status") == "1":
+    })
+    if r and r.get("status") == "1":
         raw = int(r["result"])
         scaled = raw / 10**decimals
         print(f"  {label}: {scaled:,.6f} (decimals={decimals})")
@@ -639,14 +673,14 @@ def fetch_dlend_fraxtal():
 
 def fetch_token_supply_chain(chain_id, contract, decimals, label):
     """Same as fetch_token_supply_fraxtal but parameterized chain."""
-    r = requests.get(ETHERSCAN_V2_URL, params={
+    r = _etherscan_get({
         "chainid": chain_id,
         "module": "stats",
         "action": "tokensupply",
         "contractaddress": contract,
         "apikey": ETHERSCAN_API_KEY,
-    }, timeout=15).json()
-    if r.get("status") == "1":
+    })
+    if r and r.get("status") == "1":
         raw = int(r["result"])
         scaled = raw / 10**decimals
         print(f"  {label}: {scaled:,.6f} (decimals={decimals})")
@@ -670,12 +704,13 @@ def fetch_dlend_ethereum():
 
     usd_values = {}
     for row, (sym, supply, cg_id) in supplies.items():
-        if supply is None:
-            usd_values[row] = None
-            continue
+        # ZERO override applies regardless of supply fetch success — row is always $0
         if cg_id == "ZERO":
             usd_values[row] = 0.0
             print(f"  Row {row} {sym}: forced $0.00")
+            continue
+        if supply is None:
+            usd_values[row] = None
             continue
         price = cg_prices.get(cg_id, 1.0) if cg_id else 1.0
         usd_values[row] = supply * price
@@ -958,6 +993,72 @@ def _run_dlend_ethereum():
     write_to_dlend_ethereum_sheet(fetch_dlend_ethereum())
 
 
+# Manifest of rows that MUST contain a value in today's column on each sheet.
+# Formula rows (sums/ratios) are excluded — they auto-compute from the data rows.
+EXPECTED_SHEET_ROWS = {
+    SHEET_TAB_NAME:              {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11, 16],                                  "rerun": _run_fraxtal_balance},
+    KATANA_SHEET_TAB:            {"date_row": 2, "rows": [3, 4, 5, 6, 7, 8, 9],                                           "rerun": _run_katana_balance},
+    ETHEREUM_SHEET_TAB:          {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11],                                      "rerun": _run_ethereum_balance},
+    DLEND_FRAXTAL_SHEET_TAB:     {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20],          "rerun": _run_dlend_fraxtal},
+    DLEND_ETHEREUM_SHEET_TAB:    {"date_row": 2, "rows": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20],       "rerun": _run_dlend_ethereum},
+}
+
+
+def _is_blank_cell(v):
+    """A cell counts as missing only if truly empty. '0', '0.00', '$0.00' all count as present."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    return s == ""
+
+
+def verify_today(sheet_filter=None):
+    """Read each sheet's today column, return {tab_name: [missing_row_numbers]}.
+
+    sheet_filter: optional iterable of tab names to limit which sheets to check.
+    Empty dict means every expected row has a value.
+    """
+    creds = _load_google_credentials()
+    spreadsheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}/{today.year}"
+    misses = {}
+
+    targets = sheet_filter if sheet_filter is not None else EXPECTED_SHEET_ROWS.keys()
+    for tab in targets:
+        conf = EXPECTED_SHEET_ROWS[tab]
+        sheet = spreadsheet.worksheet(tab)
+        date_row_vals = sheet.row_values(conf["date_row"])
+        col = next((i + 1 for i, c in enumerate(date_row_vals) if str(c).strip() == today_str), None)
+        if col is None:
+            # No column for today at all → every expected row is missing
+            misses[tab] = list(conf["rows"])
+            print(f"  [verify] {tab}: today's column ({today_str}) not found → all {len(conf['rows'])} rows missing")
+            continue
+
+        col_letter = gspread.utils.rowcol_to_a1(1, col).rstrip('1')
+        first, last = min(conf["rows"]), max(conf["rows"])
+        rng = f"{col_letter}{first}:{col_letter}{last}"
+        # sheet.get returns a list-of-lists; rows beyond data are absent
+        values = sheet.get(rng)
+        # Build a {row: value} map for the requested column slice
+        cell_by_row = {}
+        for offset, vrow in enumerate(values):
+            cell_by_row[first + offset] = vrow[0] if vrow else ""
+
+        sheet_misses = [r for r in conf["rows"] if _is_blank_cell(cell_by_row.get(r))]
+        if sheet_misses:
+            misses[tab] = sheet_misses
+            print(f"  [verify] {tab}: missing rows {sheet_misses}")
+        else:
+            print(f"  [verify] {tab}: all {len(conf['rows'])} rows present")
+
+    return misses
+
+
+MAX_VERIFY_ATTEMPTS = 2
+
+
 def main():
     print("="*50)
     print(f"dTRINITY Scraper | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -965,11 +1066,11 @@ def main():
     started = time.time()
 
     tasks = {
-        "Fraxtal balance":  _run_fraxtal_balance,
-        "Katana balance":   _run_katana_balance,
-        "Ethereum balance": _run_ethereum_balance,
-        "dLEND Fraxtal":    _run_dlend_fraxtal,
-        "dLEND Ethereum":   _run_dlend_ethereum,
+        SHEET_TAB_NAME:           _run_fraxtal_balance,
+        KATANA_SHEET_TAB:         _run_katana_balance,
+        ETHEREUM_SHEET_TAB:       _run_ethereum_balance,
+        DLEND_FRAXTAL_SHEET_TAB:  _run_dlend_fraxtal,
+        DLEND_ETHEREUM_SHEET_TAB: _run_dlend_ethereum,
     }
 
     failures = []
@@ -984,11 +1085,43 @@ def main():
                 print(f"\n[FAIL] {name}: {type(e).__name__}: {e}")
                 failures.append(name)
 
+    # Verify and retry any sheets with missing expected rows
+    for attempt in range(1, MAX_VERIFY_ATTEMPTS + 1):
+        print(f"\n{'='*50}")
+        print(f"[VERIFY] Pass {attempt}/{MAX_VERIFY_ATTEMPTS}")
+        print(f"{'='*50}")
+        misses = verify_today()
+        if not misses:
+            print("[OK] All expected rows populated.")
+            break
+        print(f"[VERIFY] Retrying sheets: {list(misses.keys())}")
+        with ThreadPoolExecutor(max_workers=len(misses)) as ex:
+            futures = {ex.submit(EXPECTED_SHEET_ROWS[tab]["rerun"]): tab for tab in misses}
+            for fut in as_completed(futures):
+                tab = futures[fut]
+                try:
+                    fut.result()
+                    print(f"\n[RETRY OK] {tab}")
+                except Exception as e:
+                    print(f"\n[RETRY FAIL] {tab}: {type(e).__name__}: {e}")
+
+    print(f"\n{'='*50}")
+    print(f"[VERIFY] Final check")
+    print(f"{'='*50}")
+    final_misses = verify_today()
+
     elapsed = time.time() - started
     print(f"\n{'='*50}")
-    print(f"Done in {elapsed:.1f}s. {len(tasks) - len(failures)}/{len(tasks)} sheets succeeded.")
+    print(f"Done in {elapsed:.1f}s. {len(tasks) - len(failures)}/{len(tasks)} sheets succeeded on first pass.")
     if failures:
-        print(f"Failures: {', '.join(failures)}")
+        print(f"First-pass failures: {', '.join(failures)}")
+    if final_misses:
+        print(f"[FAIL] Persistent misses after {MAX_VERIFY_ATTEMPTS} retries:")
+        for tab, rows in final_misses.items():
+            print(f"  {tab}: rows {rows}")
+        print(f"{'='*50}")
+        import sys
+        sys.exit(1)
     print(f"{'='*50}")
 
 if __name__ == "__main__":

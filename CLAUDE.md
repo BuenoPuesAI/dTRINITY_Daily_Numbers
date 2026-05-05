@@ -61,6 +61,11 @@ The Ethereum balance sheet (rows 4–10) draws from three places:
 
 If the user changes any of these wallet addresses, both the constant and the corresponding scrape function need updating.
 
+### Verify-and-retry pass at the end of `main()`
+After the parallel scrape, `main()` runs `verify_today()` to read today's column on each sheet and compare against `EXPECTED_SHEET_ROWS`. Any sheet with a blank in an expected row gets re-run (up to `MAX_VERIFY_ATTEMPTS = 2` retry passes). A cell counting `0`/`$0.00` is treated as **present** (intentional zeros like cbBTC). A truly empty cell is treated as **missing**. If anything is still missing after the retries, `main()` exits non-zero so the GitHub Action fails visibly.
+
+When adding a new data row to any sheet, also add its row number to that sheet's entry in `EXPECTED_SHEET_ROWS` — otherwise the verification pass won't notice when it goes missing.
+
 ### Sheet column count vs. row_values length
 `sheet.row_values(N)` returns up to `sheet.col_count` cells (with trailing empties), not just up to the last non-empty cell. This caused an early bug where `len(row) + 1` over-shot the grid limit. The script now calls `sheet.add_cols(...)` if the target column exceeds `sheet.col_count`.
 
