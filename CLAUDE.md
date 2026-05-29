@@ -61,6 +61,15 @@ The Ethereum balance sheet (rows 4–10) draws from three places:
 
 If the user changes any of these wallet addresses, both the constant and the corresponding scrape function need updating.
 
+### dLEND APY rows (22–25, Fraxtal + Ethereum) are derived from on-chain UI helper contracts
+`fetch_dlend_dusd_apys(chain_id)` reads two helper contracts per chain via Etherscan v2 `eth_call`:
+1. `UI_POOL_DATA_PROVIDER.getReservesData(LENDING_POOL_ADDRESS_PROVIDER)` → dUSD's `liquidityRate` (Supply APR) and `variableBorrowRate` (Gross Borrow APR), both ray-scaled per-year. Compounded to APY with `(1 + APR/SECONDS_PER_YEAR)^SECONDS_PER_YEAR − 1`, matching `@aave/math-utils.formatReserves`.
+2. `UI_INCENTIVE_DATA_PROVIDER.getReservesIncentivesData(LENDING_POOL_ADDRESS_PROVIDER)` → dUSD's `vIncentiveData.rewardsTokenInformation`. Rebate APR sums each active reward as `(emissionPerSecond × SECONDS_PER_YEAR × rewardPriceUSD ÷ rewardTokenDecimals) ÷ total_debt_usd`.
+
+Net Borrow APY = Gross Borrow APY − Rebate APR, computed in Python and written as a value (not a `=B23-B24` formula), matching `BorrowInfo.tsx:71` in `dtrinity/interface`. Values are pre-formatted percent strings (`"6.12%"`) so Sheets' `USER_ENTERED` parser converts them to percentage-typed cells inheriting the column's `%` formatting. Net can be negative when rebate > gross — frontend explicitly accommodates this ("you are getting paid to borrow").
+
+The reserve/incentive struct type strings and the function selectors are pinned in the constants near the top of `scraper.py` (`_GET_RESERVES_DATA_OUTPUT`, `_GET_RESERVES_INCENTIVES_OUTPUT`, `_SEL_GET_RESERVES_DATA = 0xec489c21`, `_SEL_GET_RESERVES_INCENTIVES = 0x976fafc5`). The signatures were verified identical across Fraxtal and Ethereum at integration time — if dTRINITY upgrades either helper contract such that struct fields change, re-derive the type strings from the new ABI before trusting the output.
+
 ### Verify-and-retry pass at the end of `main()`
 After the parallel scrape, `main()` runs `verify_today()` to read today's column on each sheet and compare against `EXPECTED_SHEET_ROWS`. Any sheet with a blank in an expected row gets re-run (up to `MAX_VERIFY_ATTEMPTS = 2` retry passes). A cell counting `0`/`$0.00` is treated as **present** (intentional zeros like cbBTC). A truly empty cell is treated as **missing**. If anything is still missing after the retries, `main()` exits non-zero so the GitHub Action fails visibly.
 
@@ -76,10 +85,10 @@ When adding a new data row to any sheet, also add its row number to that sheet's
 ## Open TODOs
 
 - [ ] **Rotate the Google service account key** in `service_account.json`. The current key (`9828eddbbd0f1ad96a3bc30d0fd71cd658953653`) was leaked in a prior conversation transcript. Revoke it in Google Cloud Console → IAM → Service Accounts → `dtrinity-scraper@dtrinity-scraper.iam.gserviceaccount.com` → Keys, then create + download a new one.
-- [ ] **dLEND APY rows** (Fraxtal rows 22/23/24 and Ethereum rows 22/23/24): blocked behind the `app.dtrinity.org` disclaimer modal. Will require either a VPN-routed Playwright scrape (with user permission to accept the disclaimer) or querying the dLEND lending pool contract directly via Etherscan v2 read-contract calls. Currently those rows are blank and the row-25 "Borrow APY (Net)" formula evaluates to 0%.
 - [ ] **cbBTC pricing fix** (Ethereum dLEND row 15): user wants $0 for now, plans to revisit.
 - [ ] **FXB exact pricing** (vs YTM-approximated): see "Non-obvious decisions" above. Only worth pursuing if the user requests higher precision.
-- [ ] **Automation / cron**: currently runs manually. The plan is to schedule daily once the user is confident in the data. Etherscan API key (`FD8P4KY6Z9HMHBWXCRN9MX9U8JTDJSA214`) is hardcoded — should move to env var before any deployment.
+
+Scheduled in `.github/workflows/daily.yml` (cron `0 8 * * *` = 8:00 UTC daily). `ETHERSCAN_API_KEY` and `GOOGLE_SERVICE_ACCOUNT_JSON` are provided via GitHub Actions secrets.
 
 ---
 

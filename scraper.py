@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 import gspread
 from google.oauth2.service_account import Credentials
+from eth_abi import decode as _abi_decode
 
 # Etherscan v2 free tier allows 5 req/sec but reports rate-limit errors at 3/sec under load.
 # Throttle globally to ~2.5/sec to stay safe across parallel sheets.
@@ -151,6 +152,43 @@ DLEND_ETHEREUM_SHEET_TAB = "dLEND Stats (Ethereum)"
 DLEND_ETHEREUM_DUSD_CONTRACT = "0x5CC741931D01Cb1ADdE193222Dfb1ad75930fd60"      # row 3, default $1
 DLEND_ETHEREUM_DUSD_DEBT_CONTRACT = "0x9477297FeacD988bE2E8bC42dFB0edf44bbfb59B" # row 19, default $1
 DLEND_ETHEREUM_DATE_ROW = 2
+
+# dLEND APYs (rows 22-25) — dUSD reserve only.
+# Addresses sourced from dtrinity/interface shared/config/markets/{fraxtal,ethereum}.ts.
+# Type strings reflect the deployed UiPoolDataProvider / UiIncentiveDataProvider
+# ABIs (verified identical across Fraxtal + Ethereum at integration time).
+DLEND_APY_ADDRESSES = {
+    FRAXTAL_CHAIN_ID: {
+        "ui_pool":         "0xE284a74c661AD0ff6fC7C07e180BBbDA8ED3Eabc",
+        "ui_incs":         "0x21bD81b33D4B04B94bd30C6f015484E830b68830",
+        "addr_prov":       "0xD9C622d64342B5FaCeef4d366B974AEf6dCB338D",
+        "dusd_underlying": DUSD_CONTRACT,
+    },
+    ETHEREUM_CHAIN_ID: {
+        "ui_pool":         "0x1C4be7D7f0184Ba6cc458Fc99880198c537867E2",
+        "ui_incs":         "0xe3Ee2d4BDe6695Cc1AE4A4cda466Bdc6d5DF479e",
+        "addr_prov":       "0xa5CaE880272183d7C8B69F8B0edF395f8E42e751",
+        "dusd_underlying": DUSD_CONTRACT_ETHEREUM,
+    },
+}
+_RESERVE_TUPLE = (
+    "(address,string,string,uint256,uint256,uint256,uint256,uint256,bool,bool,bool,bool,bool,"
+    "uint128,uint128,uint128,uint128,uint128,uint40,address,address,address,address,uint256,"
+    "uint256,uint256,uint256,uint256,uint256,address,uint256,uint256,uint256,uint256,uint256,"
+    "uint256,uint256,bool,bool,uint128,uint128,uint128,bool,uint256,uint256,uint8,uint256,"
+    "uint256,uint16,uint16,uint16,address,string,bool)"
+)
+_BASE_CURRENCY_TUPLE = "(uint256,int256,int256,uint8)"
+_GET_RESERVES_DATA_OUTPUT = [f"{_RESERVE_TUPLE}[]", _BASE_CURRENCY_TUPLE]
+_REWARD_TUPLE = "(string,address,address,uint256,uint256,uint256,uint256,int256,uint8,uint8,uint8)"
+_INCENTIVE_DATA_TUPLE = f"(address,address,{_REWARD_TUPLE}[])"
+_RESERVE_INCS_TUPLE = f"(address,{_INCENTIVE_DATA_TUPLE},{_INCENTIVE_DATA_TUPLE},{_INCENTIVE_DATA_TUPLE})"
+_GET_RESERVES_INCENTIVES_OUTPUT = [f"{_RESERVE_INCS_TUPLE}[]"]
+# Function selectors (first 4 bytes of keccak256 of signature).
+_SEL_GET_RESERVES_DATA = "0xec489c21"        # getReservesData(address)
+_SEL_GET_RESERVES_INCENTIVES = "0x976fafc5"  # getReservesIncentivesData(address)
+SECONDS_PER_YEAR = 31_536_000
+RAY = 10**27
 
 # row → (symbol, contract, decimals, coingecko_id_or_None)
 DLEND_ETHEREUM_EXTRA_TOKENS = {
@@ -663,11 +701,18 @@ def fetch_dlend_fraxtal():
     if frxeth_usd is not None:
         print(f"  Row 6 frxETH: {frxeth_supply:,.6f} × ${frxeth_price:,.2f} = ${frxeth_usd:,.2f}")
 
+    try:
+        apys = fetch_dlend_dusd_apys(FRAXTAL_CHAIN_ID)
+    except Exception as e:
+        print(f"  [APY fetch failed] {type(e).__name__}: {e}")
+        apys = None
+
     return {
         "dusd": dusd,
         "frxeth_usd": frxeth_usd,
         "sdusd": sdusd,
         "extra_rows": usd_values,
+        "apys": apys,
     }
 
 
@@ -716,7 +761,111 @@ def fetch_dlend_ethereum():
         usd_values[row] = supply * price
         print(f"  Row {row} {sym}: {supply:,.6f} × ${price} = ${usd_values[row]:,.2f}")
 
-    return {"dusd": dusd, "dusd_debt": dusd_debt, "extra_rows": usd_values}
+    try:
+        apys = fetch_dlend_dusd_apys(ETHEREUM_CHAIN_ID)
+    except Exception as e:
+        print(f"  [APY fetch failed] {type(e).__name__}: {e}")
+        apys = None
+
+    return {"dusd": dusd, "dusd_debt": dusd_debt, "extra_rows": usd_values, "apys": apys}
+
+
+def _dlend_eth_call(chain_id, to, data_hex):
+    """eth_call via Etherscan v2 proxy. Returns the result hex (no 0x prefix)."""
+    r = _etherscan_get({
+        "chainid": chain_id,
+        "module": "proxy",
+        "action": "eth_call",
+        "to": to,
+        "data": data_hex,
+        "tag": "latest",
+        "apikey": ETHERSCAN_API_KEY,
+    })
+    if not r or "result" not in r:
+        raise RuntimeError(f"eth_call {to} failed: {r}")
+    res = r["result"]
+    if isinstance(res, str) and res.startswith("0x"):
+        return res[2:]
+    raise RuntimeError(f"eth_call {to} returned unexpected: {res!r}")
+
+
+def _encode_address_arg(addr):
+    """ABI-encode a single address argument as a 32-byte hex string."""
+    return addr.lower().replace("0x", "").rjust(64, "0")
+
+
+def _compound_apr_to_apy(rate_ray):
+    """Per-Aave-math-utils: APY = (1 + APR/SECONDS_PER_YEAR)^SECONDS_PER_YEAR - 1."""
+    apr = rate_ray / RAY
+    return (1 + apr / SECONDS_PER_YEAR) ** SECONDS_PER_YEAR - 1
+
+
+def _format_pct(decimal_value):
+    return f"{decimal_value * 100:.2f}%"
+
+
+def fetch_dlend_dusd_apys(chain_id):
+    """Return four pre-formatted percentage strings for the dUSD reserve:
+    supply_apy, gross_borrow_apy, rebate_apy, net_borrow_apy.
+    Mirrors BorrowInfo.tsx + DStableBorrowAPYTooltip.tsx from dtrinity/interface.
+    """
+    cfg = DLEND_APY_ADDRESSES[chain_id]
+    arg = _encode_address_arg(cfg["addr_prov"])
+    dusd_addr = cfg["dusd_underlying"].lower()
+    print(f"\nFetching dLEND dUSD APYs (chain {chain_id})...")
+
+    pool_hex = _dlend_eth_call(chain_id, cfg["ui_pool"], _SEL_GET_RESERVES_DATA + arg)
+    reserves, base = _abi_decode(_GET_RESERVES_DATA_OUTPUT, bytes.fromhex(pool_hex))
+    market_unit, _market_price_usd, _net_price, _net_dec = base
+
+    dusd = next((r for r in reserves if r[0].lower() == dusd_addr), None)
+    if dusd is None:
+        raise RuntimeError(f"chain {chain_id}: dUSD ({dusd_addr}) not in getReservesData output")
+    decimals              = dusd[3]
+    variable_borrow_index = dusd[14]
+    liquidity_rate        = dusd[15]
+    variable_borrow_rate  = dusd[16]
+    total_scaled_var_debt = dusd[27]
+    price_in_ref          = dusd[28]
+
+    supply_apy = _compound_apr_to_apy(liquidity_rate)
+    gross_borrow_apy = _compound_apr_to_apy(variable_borrow_rate)
+
+    incs_hex = _dlend_eth_call(chain_id, cfg["ui_incs"], _SEL_GET_RESERVES_INCENTIVES + arg)
+    (reserves_incs,) = _abi_decode(_GET_RESERVES_INCENTIVES_OUTPUT, bytes.fromhex(incs_hex))
+    dusd_incs = next((r for r in reserves_incs if r[0].lower() == dusd_addr), None)
+
+    rebate_apr = 0.0
+    if dusd_incs is not None:
+        _v_token, _v_ctrl, rewards = dusd_incs[2]   # vIncentiveData (variable-debt rebate)
+        total_debt_tokens = (total_scaled_var_debt * variable_borrow_index) / RAY / (10 ** decimals)
+        dusd_price_usd = (price_in_ref / market_unit) if market_unit else 0.0
+        total_debt_usd = total_debt_tokens * dusd_price_usd
+        now = int(time.time())
+        if total_debt_usd > 0:
+            for rw in rewards:
+                emission_per_second = rw[3]
+                emission_end_ts     = rw[6]
+                reward_price_feed   = rw[7]
+                reward_decimals     = rw[8]
+                price_feed_decimals = rw[10]
+                if emission_end_ts <= now or reward_price_feed <= 0:
+                    continue
+                emission_tokens_per_year = emission_per_second * SECONDS_PER_YEAR / (10 ** reward_decimals)
+                reward_price_usd = reward_price_feed / (10 ** price_feed_decimals)
+                rebate_apr += (emission_tokens_per_year * reward_price_usd) / total_debt_usd
+
+    net_borrow_apy = gross_borrow_apy - rebate_apr
+    print(f"  Supply APY:  {_format_pct(supply_apy)}")
+    print(f"  Gross Borrow APY: {_format_pct(gross_borrow_apy)}")
+    print(f"  Rebate APY:  {_format_pct(rebate_apr)}")
+    print(f"  Net Borrow APY:   {_format_pct(net_borrow_apy)}")
+    return {
+        "supply_apy":       _format_pct(supply_apy),
+        "gross_borrow_apy": _format_pct(gross_borrow_apy),
+        "rebate_apy":       _format_pct(rebate_apr),
+        "net_borrow_apy":   _format_pct(net_borrow_apy),
+    }
 
 
 def write_to_dlend_ethereum_sheet(data):
@@ -752,9 +901,21 @@ def write_to_dlend_ethereum_sheet(data):
         updates.append({"range": gspread.utils.rowcol_to_a1(19, col), "values": [[round(data["dusd_debt"], 2)]]})
         print(f"  Row 19 (dUSD Debt): ${data['dusd_debt']:,.2f}")
 
-    # Formulas matching historical pattern: SUM(B4:B16), B23-B24, SUM(B3:B16), B19/B3, B19/B18
+    apys = data.get("apys")
+    if apys:
+        for row, key, label in [
+            (22, "supply_apy",       "Supply APY"),
+            (23, "gross_borrow_apy", "Gross Borrow APY"),
+            (24, "rebate_apy",       "Rebate APY"),
+            (25, "net_borrow_apy",   "Net Borrow APY"),
+        ]:
+            updates.append({"range": gspread.utils.rowcol_to_a1(row, col), "values": [[apys[key]]]})
+            print(f"  Row {row} ({label}): {apys[key]}")
+    else:
+        print(f"  Missing: APYs (rows 22-25)")
+
+    # Formulas matching historical pattern: SUM(B4:B16), SUM(B3:B16), B19/B3, B19/B18
     updates.append({"range": gspread.utils.rowcol_to_a1(18, col), "values": [[f"=SUM({col_letter}4:{col_letter}16)"]]})
-    updates.append({"range": gspread.utils.rowcol_to_a1(25, col), "values": [[f"={col_letter}23-{col_letter}24"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(27, col), "values": [[f"=SUM({col_letter}3:{col_letter}16)"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(28, col), "values": [[f"={col_letter}19/{col_letter}3"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(29, col), "values": [[f"={col_letter}19/{col_letter}18"]]})
@@ -820,9 +981,21 @@ def write_to_dlend_fraxtal_sheet(data):
         else:
             print(f"  Missing: row {row}")
 
+    apys = data.get("apys")
+    if apys:
+        for row, key, label in [
+            (22, "supply_apy",       "Supply APY"),
+            (23, "gross_borrow_apy", "Gross Borrow APY"),
+            (24, "rebate_apy",       "Rebate APY"),
+            (25, "net_borrow_apy",   "Net Borrow APY"),
+        ]:
+            updates.append({"range": gspread.utils.rowcol_to_a1(row, col), "values": [[apys[key]]]})
+            print(f"  Row {row} ({label}): {apys[key]}")
+    else:
+        print(f"  Missing: APYs (rows 22-25)")
+
     # Formulas matching historical pattern
     updates.append({"range": gspread.utils.rowcol_to_a1(18, col), "values": [[f"=SUM({col_letter}5:{col_letter}8)"]]})
-    updates.append({"range": gspread.utils.rowcol_to_a1(25, col), "values": [[f"={col_letter}23-{col_letter}24"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(27, col), "values": [[f"=SUM({col_letter}4:{col_letter}16)"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(28, col), "values": [[f"={col_letter}19/{col_letter}4"]]})
     updates.append({"range": gspread.utils.rowcol_to_a1(29, col), "values": [[f"={col_letter}19/{col_letter}18"]]})
@@ -999,8 +1172,8 @@ EXPECTED_SHEET_ROWS = {
     SHEET_TAB_NAME:              {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11, 16],                                  "rerun": _run_fraxtal_balance},
     KATANA_SHEET_TAB:            {"date_row": 2, "rows": [3, 4, 5, 6, 7, 8, 9],                                           "rerun": _run_katana_balance},
     ETHEREUM_SHEET_TAB:          {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11],                                      "rerun": _run_ethereum_balance},
-    DLEND_FRAXTAL_SHEET_TAB:     {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20],          "rerun": _run_dlend_fraxtal},
-    DLEND_ETHEREUM_SHEET_TAB:    {"date_row": 2, "rows": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20],       "rerun": _run_dlend_ethereum},
+    DLEND_FRAXTAL_SHEET_TAB:     {"date_row": 3, "rows": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 22, 23, 24, 25],          "rerun": _run_dlend_fraxtal},
+    DLEND_ETHEREUM_SHEET_TAB:    {"date_row": 2, "rows": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 22, 23, 24, 25],       "rerun": _run_dlend_ethereum},
 }
 
 
