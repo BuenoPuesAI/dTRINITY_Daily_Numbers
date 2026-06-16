@@ -380,7 +380,11 @@ def fetch_dusd_supply_katana():
         page = browser.new_context(
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ).new_page()
-        page.goto(KATANASCAN_DUSD_URL, wait_until="networkidle", timeout=60000)
+        # katanascan.com keeps polling in the background (live prices/blocks), so it
+        # never reaches "networkidle" → goto times out at 60s and aborts the whole
+        # Katana write. "domcontentloaded" + the 8s settle below is enough to render
+        # the "Max Total Supply" value. See git history / CLAUDE.md for context.
+        page.goto(KATANASCAN_DUSD_URL, wait_until="domcontentloaded", timeout=60000)
         time.sleep(8)
         lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
         browser.close()
