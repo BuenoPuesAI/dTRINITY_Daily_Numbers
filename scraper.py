@@ -88,7 +88,8 @@ DUSD_ROW = 16
 
 KATANA_SHEET_TAB = "dUSD Balance Sheet (Katana)"
 DEBANK_URL_KATANA = "https://debank.com/profile/0xA5f9F6238406B1301D0ED09555a2893dc1A26A49"
-KATANASCAN_DUSD_URL = "https://katanascan.com/token/0xcA52d08737E6Af8763a2bF6034B3B03868f24DDA"
+KATANA_CHAIN_ID = 747474
+KATANA_DUSD_CONTRACT = "0xcA52d08737E6Af8763a2bF6034B3B03868f24DDA"
 
 # Katana sheet token map (sheet labels in column A; vb-prefixed wallet tokens map to unprefixed sheet rows)
 KATANA_TOKEN_ROW_MAP = {
@@ -374,33 +375,12 @@ def scrape_debank_katana():
 
 
 def fetch_dusd_supply_katana():
+    # Was a Playwright scrape of katanascan.com's "Max Total Supply", which flaked
+    # constantly (row 9 was the chronic verify miss that turned every run red).
+    # Etherscan v2 supports Katana (chainid 747474), so use the same API path as
+    # every other chain — reliable and no headless browser.
     print(f"\nFetching dUSD supply (Katana)...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ).new_page()
-        # katanascan.com keeps polling in the background (live prices/blocks), so it
-        # never reaches "networkidle" → goto times out at 60s and aborts the whole
-        # Katana write. "domcontentloaded" + the 8s settle below is enough to render
-        # the "Max Total Supply" value. See git history / CLAUDE.md for context.
-        page.goto(KATANASCAN_DUSD_URL, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(8)
-        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
-        browser.close()
-
-    for i, line in enumerate(lines):
-        if line.upper() == "MAX TOTAL SUPPLY" and i + 1 < len(lines):
-            val_str = lines[i + 1].replace(',', '').strip()
-            try:
-                supply = float(val_str)
-                print(f"  dUSD (Katana): {supply:,.6f}")
-                return supply
-            except ValueError:
-                pass
-
-    print(f"  Error: Max Total Supply not found")
-    return None
+    return fetch_token_supply_chain(KATANA_CHAIN_ID, KATANA_DUSD_CONTRACT, 18, "dUSD (Katana)")
 
 
 def write_to_katana_sheet(katana_data, katana_dusd_supply):
