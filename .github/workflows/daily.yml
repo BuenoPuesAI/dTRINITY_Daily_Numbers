@@ -10,6 +10,10 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # The keepalive step below pushes a commit, so GITHUB_TOKEN needs write access
+    # (repos hand out a read-only token by default).
+    permissions:
+      contents: write
     # Bumped from 15 to 180 because main() now sleeps 1hr before each retry
     # (RETRY_DELAY_SECONDS in scraper.py). Worst case: scrape + 1hr + retry + 1hr + retry ≈ 2hr 15min.
     timeout-minutes: 180
@@ -35,3 +39,40 @@ jobs:
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python scraper.py
+
+      # GitHub disables `schedule:` triggers in public repos after 60 days with no
+      # repository activity. That is what silently killed this cron: last commit was
+      # 2026-06-29, last scheduled run 2026-08-28 (exactly +60 days), then nothing.
+      # No failure, no email — the workflow just flipped to `disabled_inactivity`.
+      #
+      # A push resets the 60-day clock, so nudge one commit whenever the default
+      # branch has been quiet for longer than the threshold. It only fires every
+      # ~45 days, so history does not fill up with a commit per run.
+      #
+      # `always()` matters: a red run still needs to keep the cron alive, and this
+      # scraper exits non-zero whenever a verify miss survives its retries.
+      #
+      # NOTE: this prevents the workflow from being disabled; it cannot revive one
+      # that is already disabled. That still needs a manual click in the Actions tab.
+      - name: Keep scheduled workflow alive
+        if: ${{ always() && github.ref_name == github.event.repository.default_branch }}
+        env:
+          THRESHOLD_DAYS: 45
+        run: |
+          set -euo pipefail
+
+          age_days=$(( ( $(date -u +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Last commit on ${GITHUB_REF_NAME} is ${age_days} day(s) old (threshold: ${THRESHOLD_DAYS})."
+
+          if [ "$age_days" -lt "$THRESHOLD_DAYS" ]; then
+            echo "Recent enough — no keepalive commit needed."
+            exit 0
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "Keepalive: reset the 60-day scheduled-workflow inactivity timer"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "Pushed keepalive commit — cron is good for another 60 days."

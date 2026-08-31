@@ -2,7 +2,9 @@
 
 Scrapes on-chain data and DeFi protocol positions for the dTRINITY protocol across multiple chains, then writes the values into a single Google Sheet (the dTRINITY balance + dLEND stats workbook).
 
-Runs once per day. Currently invoked manually; cron / scheduled task to be added later.
+Runs once per day, automatically, via the `dTRINITY Daily Scrape` GitHub Action (`.github/workflows/daily.yml`, cron `0 8 * * *` = 08:00 UTC). It can also be triggered by hand from the Actions tab, or run locally — see [Running](#running).
+
+> **If the daily column stops appearing, check whether the workflow is still enabled.** GitHub disables scheduled workflows in public repos after 60 days with no repository activity, silently — no failure, no email. This happened once already (last commit 2026-06-29 → last run 2026-08-28, exactly +60 days). The workflow now pushes a keepalive commit when the branch has been quiet for 45 days, which prevents it recurring, but a workflow that is *already* disabled has to be re-enabled by hand: **Actions → dTRINITY Daily Scrape → Enable workflow**.
 
 ---
 
@@ -13,7 +15,7 @@ The script writes one column per day into each of these tabs in spreadsheet `1ZX
 | Tab | What it tracks |
 |---|---|
 | `dUSD Balance Sheet (Fraxtal)` | Wallet `0x624E…FeBC` token holdings + Curve/Convex LP positions on wallet `0xdb10…5431` + dUSD supply on Fraxtal |
-| `dUSD Balance Sheet (Katana)` | Wallet `0xA5f9…6A49` token holdings + dUSD supply on Katana (via katanascan.com page scrape) |
+| `dUSD Balance Sheet (Katana)` | Wallet `0xA5f9…6A49` token holdings + dUSD supply on Katana |
 | `dUSD Balance Sheet (Ethereum)` | Wallet `0x84c5…53f4` token holdings + Frax/Sky protocol positions + AMO Curve LP from wallet `0x3826…f3db` + dUSD supply on Ethereum |
 | `dLEND Stats (Fraxtal)` | dLEND lending pool reserve supplies, dUSD debt, sdUSD supply on Fraxtal |
 | `dLEND Stats (Ethereum)` | dLEND lending pool reserve supplies, dUSD debt, sdUSD supply on Ethereum |
@@ -27,7 +29,7 @@ Each daily column also writes the relevant subtotal/ratio formulas (Total Assets
 - **Wallet token holdings:** [DeBank](https://debank.com) — scraped via headless Playwright (Chromium)
 - **Protocol positions** (Curve, Convex, Frax Staked, Sky Yield): same DeBank page
 - **Token supplies on-chain:** Etherscan v2 API (`api.etherscan.io/v2/api`) — supports Fraxtal (chain 252), Ethereum (chain 1), and other chains via the same endpoint
-- **dUSD supply on Katana:** scraped from `katanascan.com` token page (Katana not yet on Etherscan v2)
+- **dUSD supply on Katana:** Etherscan v2 API, chain 747474 (was a `katanascan.com` page scrape until 2026-06-29 — it flaked constantly and blanked row 9)
 - **Token prices:** [CoinGecko free API](https://api.coingecko.com/api/v3/simple/price)
 - **FXB bond prices:** scraped from `facts.frax.finance/fxb` table for YTM, then computed `Price = 1 / (1 + YTM)^t` (zero-coupon bond formula)
 
@@ -60,7 +62,9 @@ source ~/.zshrc
 # Then: dtrinity
 ```
 
-A run takes roughly 2–4 minutes (most of it is Playwright spinning up headless Chromium for the DeBank scrapes — six Chromium launches across the five sheets).
+The scrape itself takes roughly 2–4 minutes (most of it is Playwright spinning up headless Chromium for the DeBank scrapes — six Chromium launches across the five sheets).
+
+Wall-clock time for a CI run is usually much longer: if the verify pass finds a blank in an expected row, `main()` sleeps `RETRY_DELAY_SECONDS` (default 3600) before re-running that sheet, up to `MAX_VERIFY_ATTEMPTS` times. In practice most scheduled runs land around 62 minutes, i.e. one retry pass. Set `RETRY_DELAY_SECONDS=0` for local debugging.
 
 ---
 
@@ -110,7 +114,7 @@ A run takes roughly 2–4 minutes (most of it is Playwright spinning up headless
 ### Katana
 | Symbol | Source | Notes |
 |---|---|---|
-| dUSD (supply) | `katanascan.com/token/0xcA52d08737E6Af8763a2bF6034B3B03868f24DDA` (page scrape) | Katana not yet supported on Etherscan v2 API |
+| dUSD (supply) | `0xcA52d08737E6Af8763a2bF6034B3B03868f24DDA` via Etherscan v2 (chain ID 747474), 18 decimals | Katana balance sheet row 9 |
 
 ---
 

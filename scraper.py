@@ -102,6 +102,26 @@ KATANA_TOKEN_ROW_MAP = {
 }
 KATANA_DUSD_ROW = 9
 
+# --- Katana DeBank scrape reliability knobs -------------------------------
+# The Katana wallet scrape returned 0 of 6 tokens on the first pass of EVERY
+# scheduled run (verified across a month of Action logs: rows 3-8 missing in
+# verify pass 1, recovered on retry). Because an empty scrape did not raise,
+# main() reported "5/5 sheets succeeded" and only self-healed via the 1-hour
+# RETRY_DELAY_SECONDS sleep — which is why every run took ~62 minutes, and why
+# 2026-08-20 and 2026-08-27 burned BOTH retries and came one flake away from
+# exiting non-zero with a blank Katana column.
+#
+# Instead of a blind settle, poll until the expected tokens actually render,
+# and retry in-process before falling back to the hourly retry.
+KATANA_SCRAPE_ATTEMPTS = 3          # in-process attempts before giving up
+KATANA_SCRAPE_BACKOFF_SECONDS = 10  # wait between those attempts
+KATANA_RENDER_TIMEOUT_SECONDS = 45  # how long to wait for tokens to paint
+KATANA_RENDER_POLL_SECONDS = 2      # gap between reads of the rendered body
+# Accept a partial scrape only as a last resort. A wallet token that drops to a
+# zero balance can legitimately vanish from DeBank's list, so requiring all six
+# would be brittle; 0-of-6 (the observed failure) is far below this floor.
+KATANA_MIN_TOKENS = 4
+
 ETHEREUM_SHEET_TAB = "dUSD Balance Sheet (Ethereum)"
 DEBANK_URL_ETHEREUM = "https://debank.com/profile/0x84c58066a4408454b7380f168c95f571419253f4"
 DEBANK_URL_AMO_ETHEREUM = "https://debank.com/profile/0x38262effcd17cd64f6311ef688b2caa61102f3db"
@@ -327,20 +347,13 @@ def fetch_dusd_supply():
     return None
 
 
-def scrape_debank_katana():
-    print(f"\nScraping DeBank (Katana wallet)...")
+def _parse_katana_tokens(lines, verbose=True):
+    """Pull {token: usd_value} out of DeBank's rendered body text.
+
+    Split out of scrape_debank_katana so the parse can run against a partially
+    rendered page on every poll, and so it is testable without a browser.
+    """
     results = {}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ).new_page()
-        page.goto(DEBANK_URL_KATANA, wait_until="networkidle", timeout=60000)
-        time.sleep(8)
-        lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
-        browser.close()
-
     target_tokens = list(KATANA_TOKEN_ROW_MAP.keys())
 
     for i, line in enumerate(lines):
@@ -365,13 +378,85 @@ def scrape_debank_katana():
                             pass
                 if len(usd_values) >= 2:
                     results[key] = usd_values[1]
-                    print(f"  {key}: ${usd_values[1]:,.2f}")
+                    if verbose:
+                        print(f"  {key}: ${usd_values[1]:,.2f}")
                 elif usd_values:
                     results[key] = usd_values[0]
-                    print(f"  {key}: ${usd_values[0]:,.2f} (only one $ found, may be wrong)")
+                    if verbose:
+                        print(f"  {key}: ${usd_values[0]:,.2f} (only one $ found, may be wrong)")
 
-    print(f"  Results: {results}")
     return results
+
+
+def _scrape_katana_once():
+    """One browser attempt. Polls until every expected token renders, or the
+    render deadline passes — whichever comes first. Returns what it found."""
+    expected = set(KATANA_TOKEN_ROW_MAP.keys())
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ).new_page()
+            # domcontentloaded, not networkidle: DeBank polls in the background,
+            # so networkidle is not a reliable signal that the token list has
+            # painted (same trap that broke the katanascan scrape in June).
+            # The poll below is what actually decides when the data is there.
+            page.goto(DEBANK_URL_KATANA, wait_until="domcontentloaded", timeout=60000)
+
+            deadline = time.time() + KATANA_RENDER_TIMEOUT_SECONDS
+            while True:
+                lines = [l.strip() for l in page.inner_text("body").split('\n') if l.strip()]
+                results = _parse_katana_tokens(lines, verbose=False)
+                if expected.issubset(results):
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(KATANA_RENDER_POLL_SECONDS)
+        finally:
+            browser.close()
+
+    # Re-parse verbosely so the log keeps its familiar per-token lines.
+    for key, val in results.items():
+        print(f"  {key}: ${val:,.2f}")
+    return results
+
+
+def scrape_debank_katana():
+    print(f"\nScraping DeBank (Katana wallet)...")
+    expected = set(KATANA_TOKEN_ROW_MAP.keys())
+    results = {}
+
+    for attempt in range(1, KATANA_SCRAPE_ATTEMPTS + 1):
+        try:
+            results = _scrape_katana_once()
+        except Exception as e:
+            print(f"  Attempt {attempt}/{KATANA_SCRAPE_ATTEMPTS} errored: {type(e).__name__}: {e}")
+            results = {}
+
+        if expected.issubset(results):
+            print(f"  Results: {results}")
+            return results
+
+        missing = sorted(expected - set(results))
+        print(f"  Attempt {attempt}/{KATANA_SCRAPE_ATTEMPTS}: got {len(results)}/{len(expected)} tokens, missing {missing}")
+        if attempt < KATANA_SCRAPE_ATTEMPTS:
+            time.sleep(KATANA_SCRAPE_BACKOFF_SECONDS)
+
+    # Out of attempts. A partial scrape is still worth writing — verify_today()
+    # will flag whatever rows stayed blank — but an empty/near-empty one must
+    # raise so the first pass reports the failure instead of printing [OK].
+    if len(results) >= KATANA_MIN_TOKENS:
+        print(f"  WARNING: proceeding with partial scrape ({len(results)}/{len(expected)} tokens): {results}")
+        return results
+
+    raise RuntimeError(
+        f"DeBank Katana scrape found only {len(results)}/{len(expected)} tokens "
+        f"after {KATANA_SCRAPE_ATTEMPTS} attempts (need >= {KATANA_MIN_TOKENS}); "
+        f"missing {sorted(expected - set(results))}"
+    )
 
 
 def fetch_dusd_supply_katana():
